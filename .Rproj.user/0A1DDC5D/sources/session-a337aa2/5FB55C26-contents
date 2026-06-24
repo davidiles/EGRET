@@ -1,0 +1,2034 @@
+# ==============================================================================
+# functions_optimized.R
+#
+# Core functions for BAM/eBird species distribution model validation.
+# Compares model-predicted relative abundance against BAM point-count
+# observations, summarised to a hexagonal grid.
+#
+# Dependencies: sf, terra, exactextractr, ggplot2, ggforce, ggspatial,
+#               patchwork, dplyr, scales, ggnewscale, lubridate.
+# All namespace calls are explicit so this file can be sourced directly or
+# packaged without modification.
+# ==============================================================================
+
+
+# ==============================================================================
+# Section 1 – Spatial setup helpers
+# ==============================================================================
+
+#' Remove interior holes from a MULTIPOLYGON sf object
+#'
+#' After \code{sf::st_union()} the national study-area boundary often contains
+#' small interior holes (lakes, data artefacts).  This function strips all
+#' holes, then drops sub-polygons smaller than \code{min_area_km2} to remove
+#' tiny isolated fragments.
+#'
+#' This function was previously defined inline in each analysis script.
+#' It is centralised here so any change propagates to both scripts.
+#'
+#' @param x           An \code{sf} object with a single MULTIPOLYGON geometry.
+#' @param min_area_km2 Minimum area (km²) to retain after hole removal.
+#' @return An \code{sf} MULTIPOLYGON with holes and small fragments removed.
+#' @export
+remove_multipolygon_holes <- function(x, min_area_km2 = 5) {
+  g <- sf::st_geometry(x)[[1]]
+
+  g_no_holes <- sf::st_multipolygon(
+    lapply(g, function(poly) list(poly[[1]]))
+  )
+
+  sf::st_geometry(x) <- sf::st_sfc(g_no_holes, crs = sf::st_crs(x))
+
+  x %>%
+    sf::st_cast("POLYGON") %>%
+    dplyr::mutate(area_km2 = as.numeric(sf::st_area(.) / 1e6)) %>%
+    dplyr::filter(area_km2 > min_area_km2) %>%
+    dplyr::summarise() %>%
+    sf::st_cast("MULTIPOLYGON")
+}
+
+
+#' Derive a species-specific survey date window from eBird metadata
+#'
+#' Looks up \code{sp_english} in \code{ebirdst::ebirdst_runs} to find the
+#' breeding-season start and end dates, then expands the window by
+#' \code{buffer_days} on each side.  Falls back to \code{fallback_start} and
+#' \code{fallback_end} if the species is absent from eBird or has no breeding
+#' season dates.
+#'
+#' Both the BAM and eBird assessment scripts call this function so that the
+#' survey date window is defined identically for the two models.
+#'
+#' @param sp_english     Common name of the species (must match eBird).
+#' @param ebirdst_runs   The \code{ebirdst::ebirdst_runs} data frame.
+#' @param buffer_days    Integer. Days to add/subtract around the window.
+#' @param fallback_start ISO date string used when no eBird data are found.
+#' @param fallback_end   ISO date string used when no eBird data are found.
+#' @return A named list with elements \code{start_date}, \code{end_date},
+#'   \code{start_doy}, \code{end_doy}, and \code{date_label}.
+#' @export
+get_species_date_window <- function(sp_english,
+                                    ebirdst_runs,
+                                    buffer_days    = 7L,
+                                    fallback_start = "2023-06-01",
+                                    fallback_end   = "2023-07-15") {
+
+  ebird_row <- ebirdst_runs %>%
+    dplyr::filter(common_name == sp_english) %>%
+    dplyr::slice(1)
+
+  if (nrow(ebird_row) > 0 && !is.na(ebird_row$breeding_start)) {
+    start_date <- ebird_row$breeding_start
+    end_date   <- ebird_row$breeding_end
+  } else {
+    start_date <- fallback_start
+    end_date   <- fallback_end
+  }
+
+  start_doy <- lubridate::yday(as.Date(start_date)) - buffer_days
+  end_doy   <- lubridate::yday(as.Date(end_date))   + buffer_days
+
+  fmt_date <- function(d) {
+    paste(
+      format(as.Date(d), "%B"),
+      as.integer(format(as.Date(d), "%d"))
+    )
+  }
+  date_label <- paste(fmt_date(start_date), "to", fmt_date(end_date))
+
+  list(
+    start_date = start_date,
+    end_date   = end_date,
+    start_doy  = start_doy,
+    end_doy    = end_doy,
+    date_label = date_label
+  )
+}
+
+
+# ==============================================================================
+# Section 2 – Species data extraction
+# ==============================================================================
+
+#' Extract species-specific count data from a pre-filtered survey sf object
+#'
+#' Selects only the columns needed for a single species and computes
+#' \code{count_per_effort} (detections per survey-hour).  Retains the
+#' precomputed \code{hex_id} column so that downstream functions skip the
+#' expensive per-species spatial join.
+#'
+#' @param survey_sf An \code{sf} POINT object containing all species columns
+#'   (output of the BAM data filtering step).
+#' @param spcd      Four-letter BAM species code (column name in
+#'   \code{survey_sf}).
+#' @return An \code{sf} object with columns \code{survey_datetime},
+#'   \code{count}, \code{duration}, \code{hex_id}, and
+#'   \code{count_per_effort}.
+#' @export
+make_sp_dat <- function(survey_sf, spcd) {
+  survey_sf %>%
+    dplyr::select(
+      survey_datetime,
+      dplyr::all_of(spcd),
+      duration,
+      hex_id
+    ) %>%
+    dplyr::rename(count = dplyr::all_of(spcd)) %>%
+    dplyr::mutate(count_per_effort = count / (duration / 60))
+}
+
+
+# ==============================================================================
+# Section 3 – Raster preprocessing
+# ==============================================================================
+
+#' Clamp raster values below a lower bound to zero
+#'
+#' @param rast        A \code{SpatRaster}.
+#' @param lower_bound Numeric scalar; values strictly below this are set to 0.
+#' @return The modified \code{SpatRaster}.
+apply_raster_lower_bound <- function(rast, lower_bound) {
+  stopifnot(inherits(rast, "SpatRaster"))
+  stopifnot(is.numeric(lower_bound), length(lower_bound) == 1,
+            is.finite(lower_bound))
+  rast[rast < lower_bound] <- 0
+  rast
+}
+
+
+# ==============================================================================
+# Section 4 – Hexagonal grid construction and metadata
+# ==============================================================================
+
+#' Create a hexagonal grid over a study area
+#'
+#' After creation, call \code{precompute_hex_metadata()} once to attach
+#' per-hexagon area, inner diameter, and study-area coverage so those
+#' quantities are not recomputed on every species iteration.
+#'
+#' @param study_area   An \code{sf} polygon defining the grid extent.
+#' @param n_hexagons   Target number of hexagons (used when
+#'   \code{hex_width_km} is \code{NULL}).
+#' @param hex_width_km Side-to-side hexagon width in kilometres.  Takes
+#'   priority over \code{n_hexagons} when both are supplied.
+#' @param work_crs     EPSG code of a planar CRS used during grid creation.
+#'   Default 3978 (NAD83 / Canada Atlas Lambert).
+#' @return An \code{sf} polygon object with a \code{hex_id} integer column.
+#' @export
+make_hex_grid <- function(study_area,
+                          n_hexagons   = 200,
+                          hex_width_km = NULL,
+                          work_crs     = 3978) {
+  stopifnot(inherits(study_area, "sf"))
+
+  if (!is.null(hex_width_km) && !is.null(n_hexagons)) {
+    message("Using `hex_width_km`; ignoring `n_hexagons`.")
+  }
+
+  old_s2 <- sf::sf_use_s2()
+  on.exit(sf::sf_use_s2(old_s2), add = TRUE)
+  sf::sf_use_s2(FALSE)
+
+  original_crs    <- sf::st_crs(study_area)
+  study_area_work <- sf::st_transform(study_area, work_crs) %>%
+    sf::st_make_valid() %>%
+    sf::st_collection_extract("POLYGON") %>%
+    sf::st_buffer(0)
+
+  study_area_union <- sf::st_union(study_area_work)
+
+  hex_cellsize <- if (!is.null(hex_width_km)) {
+    hex_width_km * 1000
+  } else {
+    target_area <- as.numeric(sf::st_area(study_area_union)) / n_hexagons
+    sqrt(target_area / (sqrt(3) / 2))
+  }
+
+  hex_grid <- sf::st_make_grid(
+    study_area_union,
+    cellsize = hex_cellsize,
+    square   = FALSE,
+    what     = "polygons"
+  )
+
+  hex_sf <- sf::st_sf(
+    hex_id   = seq_along(hex_grid),
+    geometry = hex_grid,
+    crs      = sf::st_crs(study_area_work)
+  )
+
+  keep          <- lengths(sf::st_intersects(hex_sf, study_area_union)) > 0
+  hex_sf        <- hex_sf[keep, ]
+  hex_sf$hex_id <- seq_len(nrow(hex_sf))
+
+  if (!is.na(original_crs)) {
+    hex_sf <- sf::st_transform(hex_sf, original_crs)
+  }
+
+  hex_sf
+}
+
+
+#' Attach per-hexagon area, inner diameter, and study-area coverage
+#'
+#' Run this once after \code{make_hex_grid()} and cache the result.  All
+#' downstream functions skip recomputation when the three columns are present.
+#'
+#' Adds three columns to \code{hex_grid}:
+#' \describe{
+#'   \item{hex_area_m2}{Hexagon area in square metres.}
+#'   \item{hex_inner_diameter_m}{Inner (flat-to-flat) diameter in metres,
+#'     used for proportional circle scaling in plots.}
+#'   \item{study_area_coverage}{Fraction of the hexagon that lies inside
+#'     \code{study_area} (0–1).}
+#' }
+#'
+#' @param hex_grid   \code{sf} polygon grid from \code{make_hex_grid()}.
+#' @param study_area \code{sf} polygon defining the study boundary.
+#' @return \code{hex_grid} with the three extra columns appended.
+#' @export
+precompute_hex_metadata <- function(hex_grid, study_area) {
+  stopifnot(inherits(hex_grid,   "sf"))
+  stopifnot(inherits(study_area, "sf"))
+
+  study_area <- sf::st_transform(study_area, sf::st_crs(hex_grid))
+
+  # Per-hexagon area and inner diameter
+  hex_area_m2      <- as.numeric(sf::st_area(hex_grid))
+  # Inner diameter = 2 × inradius; for a regular hexagon: inradius = sqrt(3)/2 × side
+  # Equivalently: inner_diameter = 2 × sqrt(area / (2 × sqrt(3)))
+  hex_inner_diam_m <- 2 * sqrt(hex_area_m2 / (2 * sqrt(3)))
+
+  hex_grid$hex_area_m2          <- hex_area_m2
+  hex_grid$hex_inner_diameter_m <- hex_inner_diam_m
+
+  # Study-area coverage fraction
+  message("Precomputing study_area_coverage for ", nrow(hex_grid),
+          " hexagons — this runs once.")
+
+  study_union <- sf::st_union(study_area)
+
+  inside_area <- suppressWarnings(
+    sf::st_intersection(
+      hex_grid["hex_id"],
+      sf::st_sf(geometry = study_union)
+    )
+  ) %>%
+    dplyr::mutate(.inside_area = as.numeric(sf::st_area(geometry))) %>%
+    sf::st_drop_geometry() %>%
+    dplyr::group_by(hex_id) %>%
+    dplyr::summarise(.inside_area = sum(.inside_area, na.rm = TRUE),
+                     .groups = "drop")
+
+  hex_grid %>%
+    dplyr::left_join(inside_area, by = "hex_id") %>%
+    dplyr::mutate(
+      .inside_area        = dplyr::coalesce(.inside_area, 0),
+      study_area_coverage = .inside_area / hex_area_m2
+    ) %>%
+    dplyr::select(-.inside_area)
+}
+
+
+#' Assign each survey point its containing hexagon ID
+#'
+#' Returns \code{survey_sf} with a new integer \code{hex_id} column.  Points
+#' that do not fall within any hexagon receive \code{NA}.  Because the hex grid
+#' is fixed across an entire analysis run, this join only needs to happen once.
+#'
+#' @param survey_sf An \code{sf} POINT object of all survey locations.
+#' @param hex_grid  The hexagon grid (must already have a \code{hex_id}
+#'   column).
+#' @return \code{survey_sf} with \code{hex_id} appended.
+#' @export
+precompute_survey_hex_id <- function(survey_sf, hex_grid) {
+  stopifnot(inherits(survey_sf, "sf"))
+  stopifnot(inherits(hex_grid,  "sf"))
+  stopifnot("hex_id" %in% names(hex_grid))
+
+  message("Precomputing survey–hexagon spatial join for ",
+          nrow(survey_sf), " surveys — this runs once.")
+
+  if (sf::st_crs(survey_sf) != sf::st_crs(hex_grid)) {
+    survey_sf <- sf::st_transform(survey_sf, sf::st_crs(hex_grid))
+  }
+
+  joined <- sf::st_join(
+    survey_sf,
+    hex_grid["hex_id"],
+    join = sf::st_within,
+    left = TRUE   # keep all surveys; unmatched receive NA hex_id
+  )
+
+  # sf::st_join may suffix the column name if hex_id already existed
+  if ("hex_id.y" %in% names(joined)) {
+    joined <- joined %>%
+      dplyr::select(-dplyr::any_of("hex_id.x")) %>%
+      dplyr::rename(hex_id = hex_id.y)
+  }
+
+  joined
+}
+
+
+# ==============================================================================
+# Section 5 – Cache helpers
+# ==============================================================================
+
+#' Load a cached RDS file, or compute, save, and return the result
+#'
+#' Optionally checks whether the cache is newer than a reference file
+#' (\code{source_path}).  If the reference file is newer than the cache, the
+#' cache is treated as stale and recomputed.
+#'
+#' @param cache_path  Path to the \code{.rds} cache file.
+#' @param compute_fn  Zero-argument function that produces the object to cache.
+#' @param source_path Optional path to a source file whose modification time
+#'   is compared against the cache.  If the source is newer, the cache is
+#'   regenerated.
+#' @return The cached or freshly computed object.
+load_or_compute <- function(cache_path, compute_fn, source_path = NULL) {
+  cache_exists <- file.exists(cache_path)
+
+  stale <- if (cache_exists && !is.null(source_path) &&
+               file.exists(source_path)) {
+    file.mtime(source_path) > file.mtime(cache_path)
+  } else {
+    FALSE
+  }
+
+  if (cache_exists && !stale) {
+    message("Loading cached file: ", cache_path)
+    return(readRDS(cache_path))
+  }
+
+  if (stale) {
+    message("Cache is stale (source newer than cache): regenerating ", cache_path)
+  } else {
+    message("Cache not found: computing and saving to ", cache_path)
+  }
+
+  result <- compute_fn()
+  saveRDS(result, cache_path)
+  result
+}
+
+
+# ==============================================================================
+# Section 6 – Per-hexagon observation and prediction summaries
+# ==============================================================================
+
+#' Summarise survey observations per hexagon
+#'
+#' Uses the precomputed \code{hex_id} column on \code{dat} — no spatial
+#' join is performed.  Falls back to an \code{sf::st_within} join with a
+#' warning if \code{hex_id} is absent.
+#'
+#' @param dat      \code{sf} POINT object from \code{make_sp_dat()}, already
+#'   filtered to the species and date window of interest.
+#' @param hex_grid \code{sf} polygon grid.
+#' @return \code{hex_grid} with per-hexagon observation columns appended:
+#'   \code{n_surveys}, \code{n_surveys_detected}, \code{total_count},
+#'   \code{mean_count_per_effort}, \code{obs_detected}.
+summarize_surveys_by_hex <- function(dat, hex_grid) {
+  stopifnot(inherits(dat,      "sf"))
+  stopifnot(inherits(hex_grid, "sf"))
+  stopifnot("count_per_effort" %in% names(dat))
+  stopifnot("count"            %in% names(dat))
+
+  if (!"hex_id" %in% names(dat)) {
+    warning(
+      "hex_id column not found in `dat`. ",
+      "Run precompute_survey_hex_id() once on the full survey dataset ",
+      "to avoid a slow per-species spatial join."
+    )
+    if (sf::st_crs(dat) != sf::st_crs(hex_grid)) {
+      dat <- sf::st_transform(dat, sf::st_crs(hex_grid))
+    }
+    dat <- sf::st_join(
+      dat,
+      hex_grid["hex_id"],
+      join = sf::st_within,
+      left = FALSE
+    )
+  }
+
+  if (!"hex_id" %in% names(hex_grid)) {
+    hex_grid$hex_id <- seq_len(nrow(hex_grid))
+  }
+
+  hex_obs <- dat %>%
+    sf::st_drop_geometry() %>%
+    dplyr::filter(!is.na(hex_id)) %>%
+    dplyr::group_by(hex_id) %>%
+    dplyr::summarise(
+      n_surveys             = dplyr::n(),
+      n_surveys_detected    = sum(count > 0, na.rm = TRUE),
+      total_count           = sum(count, na.rm = TRUE),
+      mean_count_per_effort = mean(count_per_effort, na.rm = TRUE),
+      obs_detected          = any(count > 0, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  hex_grid %>%
+    dplyr::left_join(hex_obs, by = "hex_id") %>%
+    dplyr::mutate(
+      n_surveys             = dplyr::coalesce(n_surveys, 0L),
+      n_surveys_detected    = dplyr::coalesce(n_surveys_detected, 0L),
+      total_count           = dplyr::coalesce(total_count, 0),
+      mean_count_per_effort = dplyr::if_else(
+        n_surveys > 0, mean_count_per_effort, NA_real_
+      ),
+      obs_detected = dplyr::if_else(
+        n_surveys > 0,
+        dplyr::coalesce(obs_detected, FALSE),
+        NA
+      )
+    )
+}
+
+compute_flag_thresholds <- function(hex_summary,
+                                    core_cumprop      = 0.50,
+                                    low_tail_cumprop  = 0.01,
+                                    min_coverage      = 0.25) {
+  
+  # Work only with hexagons that have valid predictions
+  dat <- hex_summary %>%
+    sf::st_drop_geometry() %>%
+    dplyr::filter(
+      is.finite(pred_mean),
+      pred_mean > 0,
+      pred_coverage >= min_coverage
+    )
+  
+  if (nrow(dat) == 0) return(list(high = NA_real_, absent = NA_real_))
+  
+  # Weight each hexagon by its predicted population index
+  # (pred_mean x area x study_area_coverage), consistent with how
+  # add_cumulative_prediction_classes() works internally
+  dat <- dat %>%
+    dplyr::mutate(
+      pop_index = pred_mean *
+        dplyr::coalesce(hex_area_m2, 1) *
+        dplyr::coalesce(study_area_coverage, 1)
+    )
+  
+  total_pop <- sum(dat$pop_index, na.rm = TRUE)
+  
+  dat <- dat %>%
+    dplyr::arrange(dplyr::desc(pred_mean)) %>%
+    dplyr::mutate(
+      cum_prop = cumsum(pop_index) / total_pop
+    )
+  
+  # High-abundance threshold: lowest pred_mean among hexagons in the
+  # top core_cumprop of cumulative population (ranked high to low)
+  high_threshold <- dat %>%
+    dplyr::filter(dplyr::lag(cum_prop, default = 0) < core_cumprop) %>%
+    dplyr::pull(pred_mean) %>%
+    min(na.rm = TRUE)
+  
+  # Absence threshold: highest pred_mean among hexagons that collectively
+  # contribute less than low_tail_cumprop of the population (ranked low
+  # to high, i.e. reverse order)
+  absent_threshold <- dat %>%
+    dplyr::arrange(pred_mean) %>%
+    dplyr::mutate(
+      cum_prop_low = cumsum(pop_index) / total_pop
+    ) %>%
+    dplyr::filter(cum_prop_low < low_tail_cumprop) %>%
+    dplyr::pull(pred_mean) %>%
+    max(na.rm = TRUE)
+  
+  # Safety check
+  if (is.finite(absent_threshold) && is.finite(high_threshold) &&
+      absent_threshold >= high_threshold) {
+    warning("Absence threshold >= high-abundance threshold; ",
+            "falling back to 10% of high threshold.")
+    absent_threshold <- high_threshold * 0.1
+  }
+  
+  list(high = high_threshold, absent = absent_threshold)
+}
+
+#' Classify hexagons into five abundance categories via cumulative-population
+#' breakpoints
+#'
+#' Sorts hexagons from lowest to highest \code{pred_mean} and finds the
+#' \code{pred_mean} value at which cumulative population crosses each
+#' proportion in \code{cumpop_breaks}.  The resulting thresholds are used
+#' both for the \code{category} column (via \code{apply_thresholds()}) and
+#' as the species-specific absence / high-abundance thresholds passed to
+#' \code{assess_region()}.
+#'
+#' @param hex_summary   \code{sf} or \code{data.frame} with a \code{pred_mean}
+#'   column (and optionally the column named by \code{col}).
+#' @param col           Name of the abundance column to classify.
+#'   Default \code{"pred_mean"}.
+#' @param cumpop_breaks Named list with four numeric proportions (0–1):
+#'   \describe{
+#'     \item{absent_upper}{Upper edge of "Effectively Absent" — hexagons
+#'       summing to this fraction of total population from the low end.}
+#'     \item{low_upper}{Upper edge of "Low".}
+#'     \item{mod_upper}{Upper edge of "Moderate".}
+#'     \item{high_upper}{Upper edge of "High" (above = "Very High").}
+#'   }
+#'   Defaults to \code{list(absent_upper=0.001, low_upper=0.25,
+#'   mod_upper=0.50, high_upper=0.75)}.
+#' @return A named list with elements \code{absent_upper}, \code{low_upper},
+#'   \code{mod_upper}, \code{high_upper}, and \code{method = "cumpop"}.
+#'   The \code{absent_upper} and \code{high_upper} elements are used directly
+#'   as the absence and high-abundance flag thresholds in the assess scripts.
+#' @export
+get_thresholds_cumpop <- function(hex_summary,
+                                  col          = "pred_mean",
+                                  cumpop_breaks = list(
+                                    absent_upper = 0.001,
+                                    low_upper    = 0.25,
+                                    mod_upper    = 0.50,
+                                    high_upper   = 0.75
+                                  )) {
+
+  required_names <- c("absent_upper", "low_upper", "mod_upper", "high_upper")
+  missing_names  <- setdiff(required_names, names(cumpop_breaks))
+  if (length(missing_names) > 0) {
+    stop("cumpop_breaks is missing elements: ",
+         paste(missing_names, collapse = ", "))
+  }
+
+  x <- if (inherits(hex_summary, "sf")) {
+    sf::st_drop_geometry(hex_summary)[[col]]
+  } else {
+    hex_summary[[col]]
+  }
+  x <- x[!is.na(x)]
+
+  if (length(x) == 0) {
+    warning("get_thresholds_cumpop: no non-NA values in column '", col,
+            "'; returning NA thresholds.")
+    return(list(
+      absent_upper = NA_real_,
+      low_upper    = NA_real_,
+      mod_upper    = NA_real_,
+      high_upper   = NA_real_,
+      method       = "cumpop"
+    ))
+  }
+
+  total    <- sum(x)
+  x_sorted <- sort(x, decreasing = FALSE)
+  cum_prop <- cumsum(x_sorted) / total
+
+  # For each breakpoint: find the smallest x_sorted value at which the
+  # cumulative proportion first meets or exceeds the target.
+  find_threshold <- function(target_prop) {
+    idx <- which(cum_prop >= target_prop)
+    if (length(idx) == 0) return(max(x_sorted))
+    x_sorted[idx[1]]
+  }
+
+  absent_upper <- find_threshold(cumpop_breaks$absent_upper)
+  low_upper    <- find_threshold(cumpop_breaks$low_upper)
+  mod_upper    <- find_threshold(cumpop_breaks$mod_upper)
+  high_upper   <- find_threshold(cumpop_breaks$high_upper)
+
+  message(sprintf(
+    paste0(
+      "[Cumulative population thresholds]\n",
+      "  Effectively Absent:  pred_mean \u2264 %.6f",
+      "  (lowest hexagons summing to %.1f%% of total population)\n",
+      "  Low:                 %.6f \u2013 %.6f",
+      "  (%.1f%% \u2013 %.1f%% of cumulative population)\n",
+      "  Moderate:            %.6f \u2013 %.6f",
+      "  (%.1f%% \u2013 %.1f%% of cumulative population)\n",
+      "  High:                %.6f \u2013 %.6f",
+      "  (%.1f%% \u2013 %.1f%% of cumulative population)\n",
+      "  Very High:           pred_mean > %.6f",
+      "  (top hexagons comprising final %.1f%% of population)"
+    ),
+    absent_upper, cumpop_breaks$absent_upper * 100,
+    absent_upper, low_upper,
+    cumpop_breaks$absent_upper * 100, cumpop_breaks$low_upper * 100,
+    low_upper,    mod_upper,
+    cumpop_breaks$low_upper * 100,    cumpop_breaks$mod_upper * 100,
+    mod_upper,    high_upper,
+    cumpop_breaks$mod_upper * 100,    cumpop_breaks$high_upper * 100,
+    high_upper,
+    (1 - cumpop_breaks$high_upper) * 100
+  ))
+
+  list(
+    absent_upper  = absent_upper,
+    low_upper     = low_upper,
+    mod_upper     = mod_upper,
+    high_upper    = high_upper,
+    method        = "cumpop",
+    cumpop_breaks = cumpop_breaks
+  )
+}
+
+
+#' Apply cumulative-population thresholds to a hex summary
+#'
+#' Adds a factor column (default name \code{"category"}) with five ordered
+#' levels: Effectively Absent, Low, Moderate, High, Very High.  The column
+#' is \code{NA} where \code{col} is \code{NA}.
+#'
+#' @param hex_summary  \code{sf} or \code{data.frame} from \code{summarize_hex()}.
+#' @param thresholds   List returned by \code{get_thresholds_cumpop()}.
+#' @param col          Name of the column to classify. Default \code{"pred_mean"}.
+#' @param out_col      Name of the new category column. Default \code{"category"}.
+#' @return \code{hex_summary} with \code{out_col} appended as an ordered factor.
+#' @export
+apply_thresholds <- function(hex_summary,
+                             thresholds,
+                             col     = "pred_mean",
+                             out_col = "category") {
+
+  required_thresholds <- c("absent_upper", "low_upper", "mod_upper", "high_upper")
+  missing_t <- setdiff(required_thresholds, names(thresholds))
+  if (length(missing_t) > 0) {
+    stop("thresholds is missing elements: ", paste(missing_t, collapse = ", "))
+  }
+
+  x <- if (inherits(hex_summary, "sf")) {
+    sf::st_drop_geometry(hex_summary)[[col]]
+  } else {
+    hex_summary[[col]]
+  }
+
+  cats <- dplyr::case_when(
+    is.na(x)                          ~ NA_character_,
+    x <= thresholds$absent_upper      ~ "Effectively Absent",
+    x <  thresholds$low_upper         ~ "Low",
+    x <  thresholds$mod_upper         ~ "Moderate",
+    x <  thresholds$high_upper        ~ "High",
+    TRUE                              ~ "Very High"
+  )
+
+  hex_summary[[out_col]] <- factor(
+    cats,
+    levels = c(
+      "Effectively Absent",
+      "Low",
+      "Moderate",
+      "High",
+      "Very High"
+    )
+  )
+
+  hex_summary
+}
+
+
+#' Extract raster model predictions into each hexagon
+#'
+#' Uses \code{exactextractr} for fast polygon–raster extraction.  Falls back
+#' to \code{terra::extract} if \code{exactextractr} is not installed.
+#'
+#' Computes \code{pred_mean} (mean over non-NA pixels) and
+#' \code{pred_coverage} (fraction of hexagon pixels with raster data).
+#' Hexagons below \code{min_coverage} receive \code{pred_mean = NA}.
+#'
+#' @param hex_grid     \code{sf} polygon grid.
+#' @param rast         \code{SpatRaster} of model predictions.
+#' @param rast_max_q   Upper quantile for outlier suppression. Default 0.99.
+#' @param min_coverage Minimum raster coverage fraction for \code{pred_mean}
+#'   to be reported. Default 0.25.
+#' @return \code{hex_grid} with \code{pred_mean} and \code{pred_coverage}
+#'   columns appended.
+extract_hex_predictions <- function(hex_grid,
+                                    rast,
+                                    min_coverage = 0.25) {
+  stopifnot(inherits(hex_grid, "sf"))
+  stopifnot(inherits(rast,     "SpatRaster"))
+  stopifnot(is.numeric(min_coverage), min_coverage >= 0, min_coverage <= 1)
+
+  hex_proj  <- sf::st_transform(hex_grid, terra::crs(rast))
+  rast_crop <- terra::crop(rast, terra::vect(hex_proj))
+
+  if (requireNamespace("exactextractr", quietly = TRUE)) {
+
+    # exactextractr: use coverage_weight = FALSE so each pixel contributes
+    # equally (equivalent to terra's fun = mean, na.rm = TRUE).
+    pred_vals <- exactextractr::exact_extract(
+      rast_crop, hex_proj,
+      fun           = "mean",
+      default_value = NA_real_,
+      progress      = FALSE
+    )
+
+    # Coverage: mean of a binary raster (1 = has data, 0 = NA)
+    rast_covered <- terra::ifel(is.na(rast_crop), 0L, 1L)
+    cov_vals <- exactextractr::exact_extract(
+      rast_covered, hex_proj,
+      fun      = "mean",
+      progress = FALSE
+    )
+
+  } else {
+
+    message("exactextractr not found — falling back to terra::extract (slower).")
+
+    pred_ex   <- terra::extract(rast_crop, terra::vect(hex_proj),
+                                fun = mean, na.rm = TRUE)
+    pred_vals <- pred_ex[[2]]
+
+    rast_covered <- !is.na(rast_crop)
+    cov_ex   <- terra::extract(rast_covered, terra::vect(hex_proj),
+                               fun = mean, na.rm = TRUE)
+    cov_vals <- cov_ex[[2]]
+  }
+
+  hex_grid %>%
+    dplyr::mutate(
+      pred_coverage = dplyr::if_else(
+        is.finite(cov_vals), as.numeric(cov_vals), 0
+      ),
+      pred_mean = dplyr::if_else(
+        is.finite(pred_vals) & cov_vals >= min_coverage,
+        as.numeric(pred_vals),
+        NA_real_
+      )
+    )
+}
+
+
+#' Combine per-hexagon observation and prediction summaries
+#'
+#' @inheritParams summarize_surveys_by_hex
+#' @inheritParams extract_hex_predictions
+#' @param pred_presence_threshold Predictions at or below this value are
+#'   treated as predicted-absent. Default 0.
+#' @return \code{hex_grid} with all observation and prediction columns, plus
+#'   a logical \code{pred_detected} column.
+summarize_hex <- function(dat,
+                          hex_grid,
+                          rast,
+                          pred_presence_threshold = 0,
+                          min_coverage            = 0.25) {
+
+  hex_obs  <- summarize_surveys_by_hex(dat, hex_grid)
+
+  hex_full <- extract_hex_predictions(
+    hex_obs,
+    rast,
+    min_coverage = min_coverage
+  )
+
+  hex_full %>%
+    dplyr::mutate(
+      pred_detected = dplyr::if_else(
+        is.finite(pred_mean) & pred_mean > pred_presence_threshold,
+        TRUE, FALSE
+      )
+    )
+}
+
+
+# ==============================================================================
+# Section 7 – Study-area coverage (backward-compatibility helper)
+# ==============================================================================
+
+#' Add study-area coverage fraction to a hex summary
+#'
+#' This function is retained for backward compatibility and for grids that
+#' have not been through \code{precompute_hex_metadata()}.  It is a no-op
+#' when \code{study_area_coverage} is already present.
+add_study_area_coverage <- function(hex_summary,
+                                    study_area,
+                                    coverage_col = "study_area_coverage") {
+
+  if (coverage_col %in% names(hex_summary)) return(hex_summary)
+
+  stopifnot(inherits(hex_summary, "sf"))
+  stopifnot(inherits(study_area,  "sf"))
+  stopifnot("hex_id" %in% names(hex_summary))
+
+  study_area  <- sf::st_transform(study_area, sf::st_crs(hex_summary))
+  study_union <- sf::st_union(study_area)
+
+  hex_area <- hex_summary %>%
+    dplyr::mutate(.hex_area = as.numeric(sf::st_area(geometry))) %>%
+    sf::st_drop_geometry() %>%
+    dplyr::select(hex_id, .hex_area)
+
+  inside_area <- suppressWarnings(
+    sf::st_intersection(
+      hex_summary["hex_id"],
+      sf::st_sf(geometry = study_union)
+    )
+  ) %>%
+    dplyr::mutate(.inside_area = as.numeric(sf::st_area(geometry))) %>%
+    sf::st_drop_geometry() %>%
+    dplyr::group_by(hex_id) %>%
+    dplyr::summarise(.inside_area = sum(.inside_area, na.rm = TRUE),
+                     .groups = "drop")
+
+  hex_summary %>%
+    dplyr::left_join(hex_area,    by = "hex_id") %>%
+    dplyr::left_join(inside_area, by = "hex_id") %>%
+    dplyr::mutate(
+      .inside_area = dplyr::coalesce(.inside_area, 0),
+      "{coverage_col}" := .inside_area / .hex_area
+    ) %>%
+    dplyr::select(-.hex_area, -.inside_area)
+}
+
+
+# ==============================================================================
+# Section 8 – Region-wide statistics
+# ==============================================================================
+
+#' Compute Spearman correlation between predictions and observations
+#'
+#' Restricted to hexagons that are surveyed, have a finite prediction, and
+#' have a prediction above \code{absence_threshold} (i.e., not model-absent).
+compute_filtered_spearman <- function(hex_summary, absence_threshold) {
+
+  cor_dat <- hex_summary %>%
+    sf::st_drop_geometry() %>%
+    dplyr::filter(
+      n_surveys > 0,
+      is.finite(mean_count_per_effort),
+      is.finite(pred_mean),
+      pred_mean > absence_threshold
+    )
+
+  if (nrow(cor_dat) >= 3) {
+    stats::cor(
+      cor_dat$pred_mean,
+      cor_dat$mean_count_per_effort,
+      use    = "complete.obs",
+      method = "spearman"
+    )
+  } else {
+    NA_real_
+  }
+}
+
+
+#' Compute region-wide model-validation statistics
+#'
+#' @param hex_summary     Output of \code{summarize_hex()} after flag columns
+#'   have been attached (i.e., after \code{plot_hex_pred_obs()} has been called
+#'   and its \code{hex_summary} element extracted).
+#' @param absence_threshold Numeric. Prediction value at or below which a
+#'   hexagon is considered model-predicted absent.
+#' @return A one-row \code{data.frame}.
+#' @export
+compute_region_stats <- function(hex_summary, absence_threshold) {
+
+  required_cols <- c(
+    "n_surveys", "obs_detected",
+    "mean_count_per_effort", "pred_mean",
+    "pred_coverage", "study_area_coverage",
+    "flag_high_pred_no_detection", "flag_pred_absent_detected"
+  )
+  missing_cols <- setdiff(required_cols, names(hex_summary))
+  if (length(missing_cols) > 0) {
+    stop("hex_summary is missing columns: ",
+         paste(missing_cols, collapse = ", "))
+  }
+
+  dat      <- hex_summary %>% sf::st_drop_geometry()
+  surveyed <- dat %>% dplyr::filter(n_surveys > 0)
+  covered  <- dat %>% dplyr::filter(is.finite(pred_mean))
+
+  surveyed_covered       <- surveyed %>% dplyr::filter(is.finite(pred_mean))
+  surveyed_above_absence <- surveyed %>%
+    dplyr::filter(is.finite(pred_mean), pred_mean > absence_threshold)
+
+  n_hex_total              <- nrow(dat)
+  n_hex_pred_covered       <- nrow(covered)
+  n_hex_surveyed           <- nrow(surveyed)
+  n_hex_surveyed_covered   <- nrow(surveyed_covered)
+  n_hex_surveyed_above_absence <- nrow(surveyed_above_absence)
+
+  n_hex_detected  <- sum(surveyed$obs_detected, na.rm = TRUE)
+  n_surveys_total <- sum(surveyed$n_surveys,    na.rm = TRUE)
+
+  n_flag_high_pred_no_detection <- sum(
+    dat$flag_high_pred_no_detection, na.rm = TRUE
+  )
+  n_flag_pred_absent_detected <- sum(
+    dat$flag_pred_absent_detected, na.rm = TRUE
+  )
+  n_flag_any <- sum(
+    dat$flag_high_pred_no_detection | dat$flag_pred_absent_detected,
+    na.rm = TRUE
+  )
+
+  spearman_obs_pred_above_absence <- compute_filtered_spearman(
+    hex_summary       = hex_summary,
+    absence_threshold = absence_threshold
+  )
+
+  data.frame(
+    n_hex_total                  = n_hex_total,
+    n_hex_pred_covered           = n_hex_pred_covered,
+    prop_hex_pred_covered        = n_hex_pred_covered / n_hex_total,
+
+    n_hex_surveyed               = n_hex_surveyed,
+    n_hex_surveyed_covered       = n_hex_surveyed_covered,
+    prop_surveyed_covered        = if (n_hex_surveyed > 0)
+      n_hex_surveyed_covered / n_hex_surveyed else NA_real_,
+
+    n_hex_surveyed_above_absence = n_hex_surveyed_above_absence,
+
+    n_surveys_total              = n_surveys_total,
+    mean_surveys_per_hex         = if (n_hex_surveyed > 0)
+      n_surveys_total / n_hex_surveyed else NA_real_,
+
+    n_hex_detected               = n_hex_detected,
+    prop_hex_detected            = if (n_hex_surveyed > 0)
+      n_hex_detected / n_hex_surveyed else NA_real_,
+
+    spearman_obs_pred_above_absence = spearman_obs_pred_above_absence,
+    absence_threshold            = absence_threshold,
+
+    n_flag_high_pred_no_detection = n_flag_high_pred_no_detection,
+    n_flag_pred_absent_detected   = n_flag_pred_absent_detected,
+    n_flag_any                    = n_flag_any,
+
+    prop_surveyed_flagged        = if (n_hex_surveyed > 0)
+      n_flag_any / n_hex_surveyed else NA_real_,
+
+    prop_detected_in_pred_absent = if (n_hex_detected > 0)
+      n_flag_pred_absent_detected / n_hex_detected else NA_real_
+  )
+}
+
+
+# ==============================================================================
+# Section 9 – Diagnostic threshold helpers
+# ==============================================================================
+
+resolve_effort_threshold <- function(n_surveys,
+                                     effort_min_surveys = NULL,
+                                     effort_quantile    = NULL) {
+  surveyed_n <- n_surveys[!is.na(n_surveys) & n_surveys > 0]
+
+  if (!is.null(effort_min_surveys)) return(as.integer(effort_min_surveys))
+
+  if (!is.null(effort_quantile) && length(surveyed_n) >= 4) {
+    return(as.integer(ceiling(stats::quantile(
+      surveyed_n, probs = effort_quantile, na.rm = TRUE
+    ))))
+  }
+
+  1L
+}
+
+
+#' Add cumulative-population and density-based diagnostic classes
+#'
+#' Classifies hexagons as "high abundance" or "effectively absent" based on
+#' where they fall in the predicted-abundance distribution.  Reads
+#' \code{hex_area_m2} from precomputed columns when available to avoid
+#' repeated \code{sf::st_area()} calls.
+add_cumulative_prediction_classes <- function(hex_summary,
+                                              min_coverage             = 0.25,
+                                              high_pred_cumprop        = 0.50,
+                                              high_pred_threshold      = NULL,
+                                              absence_fraction_of_high = 0.01,
+                                              absence_threshold        = NULL) {
+  stopifnot(inherits(hex_summary, "sf"))
+  stopifnot("hex_id"        %in% names(hex_summary))
+  stopifnot("pred_mean"     %in% names(hex_summary))
+  stopifnot("pred_coverage" %in% names(hex_summary))
+
+  if (!is.null(high_pred_cumprop)) {
+    stopifnot(
+      is.numeric(high_pred_cumprop), length(high_pred_cumprop) == 1,
+      is.finite(high_pred_cumprop), high_pred_cumprop > 0,
+      high_pred_cumprop <= 1
+    )
+  }
+  if (!is.null(absence_fraction_of_high)) {
+    stopifnot(
+      is.numeric(absence_fraction_of_high),
+      length(absence_fraction_of_high) == 1,
+      is.finite(absence_fraction_of_high),
+      absence_fraction_of_high >= 0
+    )
+  }
+
+  # Use precomputed area when available; fall back to sf::st_area()
+  hex_area <- if ("hex_area_m2" %in% names(hex_summary)) {
+    hex_summary$hex_area_m2
+  } else {
+    as.numeric(sf::st_area(hex_summary))
+  }
+
+  study_area_coverage <- if ("study_area_coverage" %in% names(hex_summary)) {
+    dplyr::coalesce(hex_summary$study_area_coverage, 0)
+  } else {
+    rep(1, nrow(hex_summary))
+  }
+
+  dat <- hex_summary %>%
+    dplyr::mutate(
+      valid_pred_for_threshold =
+        is.finite(pred_mean) &
+        !is.na(pred_coverage) &
+        pred_coverage >= min_coverage,
+      pred_population_area  = hex_area * pmax(study_area_coverage, 0),
+      pred_population_index = dplyr::if_else(
+        valid_pred_for_threshold,
+        pmax(pred_mean, 0) * pred_population_area,
+        NA_real_
+      )
+    )
+
+  total_pred_population <- sum(dat$pred_population_index, na.rm = TRUE)
+
+  cumulative_high_pred_threshold <- NA_real_
+  relative_absence_threshold     <- NA_real_
+  n_high_pred_reference_hex      <- 0L
+  pred_population_in_high_tail   <- NA_real_
+
+  dat$pred_population_prop      <- NA_real_
+  dat$cum_pred_prop_high_to_low <- NA_real_
+  dat$in_high_cumulative_tail   <- FALSE
+
+  if (is.finite(total_pred_population) && total_pred_population > 0) {
+
+    rank_dat <- dat %>%
+      sf::st_drop_geometry() %>%
+      dplyr::select(hex_id, pred_mean, pred_population_index) %>%
+      dplyr::filter(is.finite(pred_population_index)) %>%
+      dplyr::mutate(
+        pred_population_prop = pred_population_index / total_pred_population
+      )
+
+    high_rank <- rank_dat %>%
+      dplyr::arrange(dplyr::desc(pred_mean), hex_id) %>%
+      dplyr::mutate(
+        cum_pred_prop_high_to_low = cumsum(pred_population_prop),
+        cum_pred_prop_high_to_low_lag = dplyr::lag(
+          cum_pred_prop_high_to_low, default = 0
+        ),
+        in_high_cumulative_tail = if (!is.null(high_pred_cumprop)) {
+          cum_pred_prop_high_to_low_lag < high_pred_cumprop
+        } else {
+          FALSE
+        }
+      ) %>%
+      dplyr::select(
+        hex_id, pred_population_prop,
+        cum_pred_prop_high_to_low, in_high_cumulative_tail
+      )
+
+    dat <- dat %>%
+      dplyr::select(
+        -pred_population_prop,
+        -cum_pred_prop_high_to_low,
+        -in_high_cumulative_tail
+      ) %>%
+      dplyr::left_join(high_rank, by = "hex_id") %>%
+      dplyr::mutate(
+        in_high_cumulative_tail = dplyr::coalesce(in_high_cumulative_tail,
+                                                  FALSE)
+      )
+
+    high_tail <- dat %>%
+      sf::st_drop_geometry() %>%
+      dplyr::filter(in_high_cumulative_tail)
+
+    n_high_pred_reference_hex    <- nrow(high_tail)
+    pred_population_in_high_tail <- sum(high_tail$pred_population_prop,
+                                        na.rm = TRUE)
+
+    if (n_high_pred_reference_hex > 0) {
+      cumulative_high_pred_threshold <- min(high_tail$pred_mean, na.rm = TRUE)
+    }
+  }
+
+  high_pred_candidates <- c(cumulative_high_pred_threshold, high_pred_threshold)
+  high_pred_candidates <- high_pred_candidates[is.finite(high_pred_candidates)]
+  resolved_high_pred_threshold <- if (length(high_pred_candidates) > 0)
+    max(high_pred_candidates) else NA_real_
+
+  if (is.finite(resolved_high_pred_threshold)) {
+    relative_absence_threshold <- absence_fraction_of_high *
+      resolved_high_pred_threshold
+  }
+
+  absence_candidates <- c(relative_absence_threshold, absence_threshold)
+  absence_candidates <- absence_candidates[is.finite(absence_candidates)]
+  resolved_absence_threshold <- if (length(absence_candidates) > 0)
+    max(absence_candidates) else NA_real_
+
+  out <- dat %>%
+    dplyr::mutate(
+      effectively_absent =
+        is.finite(resolved_absence_threshold) &
+        is.finite(pred_mean) &
+        !is.na(pred_coverage) &
+        pred_coverage >= min_coverage &
+        pred_mean <= resolved_absence_threshold,
+
+      high_abundance =
+        is.finite(resolved_high_pred_threshold) &
+        is.finite(pred_mean) &
+        pred_coverage >= min_coverage &
+        pred_mean >= resolved_high_pred_threshold
+    )
+
+  attr(out, "flag_thresholds") <- list(
+    high_pred_cumprop              = high_pred_cumprop,
+    high_pred_cumulative_threshold = cumulative_high_pred_threshold,
+    high_pred_absolute_threshold   = high_pred_threshold,
+    high_pred_threshold            = resolved_high_pred_threshold,
+    n_high_pred_reference_hex      = n_high_pred_reference_hex,
+    pred_population_in_high_tail   = pred_population_in_high_tail,
+    absence_fraction_of_high       = absence_fraction_of_high,
+    absence_relative_threshold     = relative_absence_threshold,
+    absence_absolute_threshold     = absence_threshold,
+    absence_threshold              = resolved_absence_threshold,
+    min_coverage                   = min_coverage,
+    total_pred_population_index    = total_pred_population
+  )
+
+  out
+}
+
+
+# ==============================================================================
+# Section 10 – Master assessment wrapper
+# ==============================================================================
+
+#' Assess model predictions against survey observations at any spatial scale
+#'
+#' Performance notes
+#' -----------------
+#' For large national grids (80,000+ hexagons) run across many species, call
+#' \code{precompute_hex_metadata()} and \code{precompute_survey_hex_id()} once
+#' before entering the species loop.  This eliminates the two most expensive
+#' per-species operations (study-area coverage intersection and the
+#' survey–hexagon spatial join).
+#'
+#' @param region       \code{sf} polygon defining the assessment boundary.
+#' @param sp_dat       \code{sf} POINT object of species-specific survey data
+#'   (output of \code{make_sp_dat()} filtered to the date window).
+#' @param rast         \code{SpatRaster} of model predictions.
+#' @param hex_grid     Pre-built hexagon grid, ideally after
+#'   \code{precompute_hex_metadata()}.
+#' @inheritParams plot_hex_pred_obs
+#' @return A list: \code{plot_combined}, \code{hex_summary},
+#'   \code{region_stats}, \code{flag_thresholds}.
+#' @export
+assess_region <- function(region,
+                          sp_dat,
+                          rast,
+                          hex_grid                        = NULL,
+                          hex_summary_precomputed         = NULL,
+                          n_hexagons                      = 1000,
+                          water                           = NULL,
+                          rast_max_q                      = 0.99,
+                          transform                       = "identity",
+                          pred_presence_threshold         = 0,
+                          min_coverage                    = 0.25,
+                          min_study_area_coverage         = 0.50,
+                          flag_high_pred_cumprop          = 0.50,
+                          flag_high_pred_threshold        = NULL,
+                          flag_high_pred_min_surveys      = 50,
+                          flag_high_pred_effort_quantile  = NULL,
+                          flag_absence_fraction_of_high   = 0.01,
+                          flag_absence_threshold          = NULL,
+                          flag_absence_min_surveys        = 1,
+                          flag_absence_effort_quantile    = NULL,
+                          flag_col_high_pred_no_detection = "#0072B2",
+                          flag_col_pred_absent_detected   = "orangered",
+                          flag_linewidth                  = 0.2,
+                          title                           = NULL,
+                          model_source                    = NULL,
+                          data_source                     = NULL) {
+
+  stopifnot(inherits(region, "sf"))
+  stopifnot(inherits(sp_dat, "sf"))
+  stopifnot(inherits(rast,   "SpatRaster"))
+  if (!is.null(hex_grid)) stopifnot(inherits(hex_grid, "sf"))
+
+  region <- sf::st_transform(region, sf::st_crs(sp_dat))
+  sp_dat <- sf::st_filter(sp_dat, region, .predicate = sf::st_intersects)
+
+  region_vect  <- region %>%
+    sf::st_transform(terra::crs(rast)) %>%
+    terra::vect()
+
+  rast_cropped <- rast %>%
+    terra::crop(region_vect) %>%
+    terra::mask(region_vect)
+
+  if (is.null(hex_grid)) {
+    hex_grid <- make_hex_grid(region, n_hexagons = n_hexagons)
+  }
+
+  hex_summary <- if (!is.null(hex_summary_precomputed)) {
+    hex_summary_precomputed
+  } else {
+    summarize_hex(
+      dat                     = sp_dat,
+      hex_grid                = hex_grid,
+      rast                    = rast_cropped,
+      rast_max_q              = rast_max_q,
+      pred_presence_threshold = pred_presence_threshold,
+      min_coverage            = min_coverage
+    )
+  }
+
+  # No-op if study_area_coverage is already present from precomputation
+  hex_summary <- add_study_area_coverage(hex_summary, region)
+
+  p_hex <- plot_hex_pred_obs(
+    hex_summary                     = hex_summary,
+    rast                            = rast_cropped,
+    study_area                      = region,
+    water                           = water,
+    rast_max_q                      = rast_max_q,
+    transform                       = transform,
+    min_coverage                    = min_coverage,
+    min_study_area_coverage         = min_study_area_coverage,
+    flag_high_pred_cumprop          = flag_high_pred_cumprop,
+    flag_high_pred_threshold        = flag_high_pred_threshold,
+    flag_high_pred_min_surveys      = flag_high_pred_min_surveys,
+    flag_high_pred_effort_quantile  = flag_high_pred_effort_quantile,
+    flag_absence_fraction_of_high   = flag_absence_fraction_of_high,
+    flag_absence_threshold          = flag_absence_threshold,
+    flag_absence_min_surveys        = flag_absence_min_surveys,
+    flag_absence_effort_quantile    = flag_absence_effort_quantile,
+    flag_col_high_pred_no_detection = flag_col_high_pred_no_detection,
+    flag_col_pred_absent_detected   = flag_col_pred_absent_detected,
+    flag_linewidth                  = flag_linewidth
+  )
+
+  hex_summary  <- p_hex$hex_summary
+
+  region_stats <- compute_region_stats(
+    hex_summary       = hex_summary,
+    absence_threshold = p_hex$flag_thresholds$absence_threshold
+  )
+
+  p_honey <- plot_honeycomb(
+    hex_summary = hex_summary,
+    study_area  = region,
+    water       = water
+  )
+
+  margin_theme <- ggplot2::theme(
+    plot.margin = ggplot2::margin(5, 10, 5, 10)
+  )
+
+  combined <- patchwork::wrap_plots(
+    list(p_hex$plot + margin_theme, p_honey + margin_theme),
+    ncol = 2
+  )
+
+  if (!is.null(title) || !is.null(model_source) || !is.null(data_source)) {
+    subtitle <- NULL
+    if (!is.null(model_source) || !is.null(data_source)) {
+      parts <- c(
+        if (!is.null(model_source)) paste("Model:", model_source),
+        if (!is.null(data_source))  paste("Data:",  data_source)
+      )
+      subtitle <- paste(parts, collapse = "   |   ")
+    }
+    combined <- combined +
+      patchwork::plot_annotation(
+        title    = title,
+        subtitle = subtitle,
+        theme    = ggplot2::theme(
+          plot.title    = ggplot2::element_text(size = 18, face = "bold",
+                                                margin = ggplot2::margin(b = 2)),
+          plot.subtitle = ggplot2::element_text(size = 12, colour = "grey30",
+                                                margin = ggplot2::margin(b = 6))
+        )
+      )
+  }
+
+  list(
+    plot_combined   = combined,
+    hex_summary     = hex_summary,
+    region_stats    = region_stats,
+    flag_thresholds = p_hex$flag_thresholds
+  )
+}
+
+
+# ==============================================================================
+# Section 11 – Water-layer helpers
+# ==============================================================================
+
+process_water <- function(study_area,
+                          water,
+                          target_crs = paste0(
+                            "+proj=lcc +lat_1=49 +lat_2=77 +lat_0=49",
+                            " +lon_0=-95 +datum=NAD83 +units=km +no_defs"
+                          ),
+                          area_breaks_km2        = c(25e3, 250e3),
+                          simplify_tolerances_km = c(fine   = 0.05,
+                                                     medium = 1,
+                                                     coarse = 10)) {
+  stopifnot(inherits(study_area, "sf"))
+  stopifnot(inherits(water,      "sf"))
+
+  study_area <- sf::st_transform(study_area, target_crs)
+  water      <- sf::st_transform(water,      target_crs)
+
+  study_area_union <- sf::st_union(study_area)
+  water_sub <- water %>%
+    sf::st_crop(sf::st_bbox(study_area)) %>%
+    sf::st_filter(study_area_union, .predicate = sf::st_intersects)
+
+  water_layers <- list(
+    fine   = sf::st_simplify(water_sub,
+                             dTolerance       = simplify_tolerances_km[["fine"]],
+                             preserveTopology = TRUE),
+    medium = sf::st_simplify(water_sub,
+                             dTolerance       = simplify_tolerances_km[["medium"]],
+                             preserveTopology = TRUE),
+    coarse = sf::st_simplify(water_sub,
+                             dTolerance       = simplify_tolerances_km[["coarse"]],
+                             preserveTopology = TRUE)
+  )
+
+  structure(
+    list(
+      water_layers    = water_layers,
+      study_area      = study_area,
+      region_area_km2 = as.numeric(sf::st_area(study_area_union)),
+      area_breaks_km2 = area_breaks_km2,
+      crs             = sf::st_crs(study_area)
+    ),
+    class = c("processed_water", "list")
+  )
+}
+
+
+resolve_water_layer <- function(water, study_area) {
+  region_area_km2 <- as.numeric(sf::st_area(sf::st_union(study_area)))
+  detail <- dplyr::case_when(
+    region_area_km2 < water$area_breaks_km2[1] ~ "fine",
+    region_area_km2 < water$area_breaks_km2[2] ~ "medium",
+    TRUE                                        ~ "coarse"
+  )
+  water$water_layers[[detail]] %>%
+    sf::st_crop(study_area) %>%
+    sf::st_filter(study_area, .predicate = sf::st_intersects) %>%
+    sf::st_intersection(study_area)
+}
+
+
+# ==============================================================================
+# Section 12 – Plot panel helpers
+# ==============================================================================
+
+make_effort_classes <- function(max_surveys, alpha_min, alpha_max) {
+
+  max_surveys <- ceiling(max_surveys)
+  if (!is.finite(max_surveys) || max_surveys < 1) max_surveys <- 1
+
+  n_positive_classes <- min(4, max_surveys)
+  positive_breaks <- unique(ceiling(
+    (seq(0, 1, length.out = n_positive_classes + 1)^2) * max_surveys
+  ))
+  positive_breaks <- positive_breaks[positive_breaks > 0]
+  positive_breaks[length(positive_breaks)] <- max_surveys
+
+  starts <- c(1, head(positive_breaks, -1) + 1)
+  ends   <- positive_breaks
+  valid  <- starts <= ends
+  starts <- starts[valid]
+  ends   <- ends[valid]
+
+  positive_labels <- ifelse(
+    starts == ends,
+    as.character(starts),
+    paste0(starts, "-", ends)
+  )
+
+  effort_levels <- c("0", positive_labels, paste0(">", max_surveys))
+
+  alpha_values <- c(
+    "0" = 0,
+    setNames(
+      seq(alpha_min, alpha_max, length.out = length(positive_labels) + 1),
+      c(positive_labels, paste0(">", max_surveys))
+    )
+  )
+
+  list(
+    max_surveys     = max_surveys,
+    starts          = starts,
+    ends            = ends,
+    positive_labels = positive_labels,
+    effort_levels   = effort_levels,
+    alpha_values    = alpha_values
+  )
+}
+
+
+# -- Panel A: raw raster -------------------------------------------------------
+
+#' @export
+plot_raster_gg <- function(rast,
+                           study_area,
+                           water      = NULL,
+                           rast_max_q = 0.99,
+                           palette    = NULL,
+                           water_fill = "#b8dceb",
+                           transform  = "identity") {
+
+  stopifnot(inherits(rast,       "SpatRaster"))
+  stopifnot(inherits(study_area, "sf"))
+
+  if (is.null(palette)) {
+    palette <- grDevices::colorRampPalette(c(
+      "#FBF7E2", "#FCF8D0", "#EEF7C2", "#CEF2B0",
+      "#94E5A0", "#51C987", "#18A065", "#008C59",
+      "#007F53", "#006344"
+    ))(100)
+  }
+
+  water_to_plot <- NULL
+  if (!is.null(water)) {
+    stopifnot(inherits(water, "processed_water"))
+    plot_crs   <- water$crs
+    study_area <- sf::st_transform(study_area, plot_crs)
+    rast       <- terra::project(rast, plot_crs$wkt)
+    water_to_plot <- resolve_water_layer(water, study_area)
+  } else {
+    plot_crs <- sf::st_crs(study_area)
+    rast     <- terra::project(rast, plot_crs$wkt)
+  }
+
+  rast <- terra::crop(rast, terra::vect(study_area))
+  rast <- terra::mask(rast, terra::vect(study_area))
+
+  r_max <- as.numeric(stats::quantile(
+    terra::values(rast)[terra::values(rast) > 0], rast_max_q, na.rm = TRUE
+  ))
+  if (!is.finite(r_max) || r_max <= 0) r_max <- 1
+  rast <- terra::clamp(rast, upper = r_max, values = TRUE)
+
+  rast_df           <- as.data.frame(rast, xy = TRUE, na.rm = FALSE)
+  names(rast_df)[3] <- "value"
+  rast_zero    <- dplyr::filter(rast_df, !is.na(value) & value == 0)
+  rast_nonzero <- dplyr::filter(rast_df, !is.na(value) & value  > 0)
+
+  p <- ggplot2::ggplot() +
+    ggplot2::geom_sf(data = study_area, fill = "gray80", colour = NA) +
+    ggplot2::geom_raster(data = rast_zero,
+                         ggplot2::aes(x = x, y = y), fill = "white") +
+    ggplot2::geom_raster(data = rast_nonzero,
+                         ggplot2::aes(x = x, y = y, fill = value)) +
+    ggplot2::geom_sf(data = study_area, fill = NA, colour = "gray30")
+
+  if (!is.null(water_to_plot)) {
+    p <- p + ggplot2::geom_sf(data = water_to_plot,
+                              fill = water_fill, colour = water_fill,
+                              linewidth = 0.1)
+  }
+
+  p +
+    ggspatial::annotation_scale(location = "br", width_hint = 0.25) +
+    ggspatial::annotation_north_arrow(
+      location    = "tr",
+      which_north = "true",
+      style       = ggspatial::north_arrow_fancy_orienteering
+    ) +
+    ggplot2::scale_fill_gradientn(
+      colours = palette, limits = c(0, r_max),
+      oob  = scales::squish, trans = transform,
+      name = "Relative abundance"
+    ) +
+    ggplot2::coord_sf() +
+    ggplot2::theme_void() +
+    ggplot2::theme(
+      legend.position      = c(0.03, 0.03),
+      legend.justification = c(0, 0),
+      legend.background    = ggplot2::element_rect(fill = "white", colour = NA),
+      legend.margin        = ggplot2::margin(4, 4, 4, 4),
+      legend.box.margin    = ggplot2::margin(6, 6, 6, 6),
+      plot.background      = ggplot2::element_rect(fill = "white",
+                                                   colour = "black",
+                                                   linewidth = 0.5),
+      panel.background     = ggplot2::element_rect(fill = "white", colour = NA),
+      plot.title    = ggplot2::element_text(size = 14, face = "bold", hjust = 0),
+      plot.subtitle = ggplot2::element_text(size = 12, hjust = 0,
+                                            margin = ggplot2::margin(b = 6))
+    ) +
+    ggplot2::labs(title = "Model predictions")
+}
+
+
+# -- Panel B: predicted vs. observed ------------------------------------------
+
+#' @export
+plot_hex_pred_obs <- function(hex_summary,
+                              rast,
+                              study_area,
+                              water                           = NULL,
+                              rast_max_q                      = 0.99,
+                              max_count_per_effort            = NULL,
+                              palette                         = NULL,
+                              circle_fill                     = "black",
+                              water_fill                      = "#b8dceb",
+                              transform                       = "identity",
+                              min_coverage                    = 0.25,
+                              min_study_area_coverage         = 0.50,
+                              flag_high_pred_cumprop          = 0.50,
+                              flag_high_pred_threshold        = NULL,
+                              flag_high_pred_min_surveys      = 50,
+                              flag_high_pred_effort_quantile  = NULL,
+                              flag_absence_fraction_of_high   = 0.01,
+                              flag_absence_threshold          = NULL,
+                              flag_absence_min_surveys        = 1,
+                              flag_absence_effort_quantile    = NULL,
+                              flag_col_high_pred_no_detection = "red",
+                              flag_col_pred_absent_detected   = "blue",
+                              flag_linewidth                  = 0.8,
+                              flag_fill_alpha                 = 0.1) {
+
+  stopifnot(inherits(hex_summary, "sf"))
+  stopifnot(inherits(rast,        "SpatRaster"))
+  stopifnot(inherits(study_area,  "sf"))
+  stopifnot("mean_count_per_effort" %in% names(hex_summary))
+  stopifnot("n_surveys"             %in% names(hex_summary))
+
+  if (!"pred_mean" %in% names(hex_summary)) {
+    hex_summary <- extract_hex_predictions(hex_summary, rast,
+                                           rast_max_q   = rast_max_q,
+                                           min_coverage = min_coverage)
+  }
+
+  if (!"study_area_coverage" %in% names(hex_summary)) {
+    hex_summary <- add_study_area_coverage(hex_summary, study_area)
+  }
+
+  if (is.null(palette)) {
+    palette <- grDevices::colorRampPalette(c(
+      "#FBF7E2", "#FCF8D0", "#EEF7C2", "#CEF2B0",
+      "#94E5A0", "#51C987", "#18A065", "#008C59",
+      "#007F53", "#006344"
+    ))(100)
+  }
+
+  water_to_plot <- NULL
+  if (!is.null(water)) {
+    stopifnot(inherits(water, "processed_water"))
+    plot_crs    <- water$crs
+    study_area  <- sf::st_transform(study_area,  plot_crs)
+    hex_summary <- sf::st_transform(hex_summary, plot_crs)
+    rast        <- terra::project(rast, plot_crs$wkt)
+    water_to_plot <- resolve_water_layer(water, study_area)
+  } else {
+    plot_crs    <- sf::st_crs(hex_summary)
+    study_area  <- sf::st_transform(study_area,  plot_crs)
+    hex_summary <- sf::st_transform(hex_summary, plot_crs)
+    rast        <- terra::project(rast, plot_crs$wkt)
+  }
+
+  rast_display <- terra::crop(rast, terra::vect(study_area)) %>%
+    terra::mask(terra::vect(study_area))
+
+  r_max <- as.numeric(stats::quantile(
+    terra::values(rast_display)[terra::values(rast_display) > 0],
+    rast_max_q, na.rm = TRUE
+  ))
+  if (!is.finite(r_max) || r_max <= 0) r_max <- 1
+  rast_display <- terra::clamp(rast_display, upper = r_max, values = TRUE)
+
+  rast_df           <- as.data.frame(rast_display, xy = TRUE, na.rm = FALSE)
+  names(rast_df)[3] <- "value"
+  rast_zero    <- dplyr::filter(rast_df, !is.na(value) & value == 0)
+  rast_nonzero <- dplyr::filter(rast_df, !is.na(value) & value  > 0)
+
+  # Cumulative abundance / absence classification
+  hex_summary <- add_cumulative_prediction_classes(
+    hex_summary              = hex_summary,
+    min_coverage             = min_coverage,
+    high_pred_cumprop        = flag_high_pred_cumprop,
+    high_pred_threshold      = flag_high_pred_threshold,
+    absence_fraction_of_high = flag_absence_fraction_of_high,
+    absence_threshold        = flag_absence_threshold
+  )
+  abundance_thresholds <- attr(hex_summary, "flag_thresholds")
+
+  resolved_min_surveys_high_pred <- resolve_effort_threshold(
+    n_surveys          = hex_summary$n_surveys,
+    effort_min_surveys = flag_high_pred_min_surveys,
+    effort_quantile    = flag_high_pred_effort_quantile
+  )
+  resolved_min_surveys_absence <- resolve_effort_threshold(
+    n_surveys          = hex_summary$n_surveys,
+    effort_min_surveys = flag_absence_min_surveys,
+    effort_quantile    = flag_absence_effort_quantile
+  )
+
+  hex_summary <- hex_summary %>%
+    dplyr::mutate(
+      obs_detected_flag = dplyr::coalesce(obs_detected, FALSE),
+
+      flag_high_pred_no_detection =
+        high_abundance &
+        study_area_coverage >= min_study_area_coverage &
+        n_surveys >= resolved_min_surveys_high_pred &
+        !obs_detected_flag,
+
+      flag_pred_absent_detected =
+        effectively_absent &
+        pred_coverage > 0 &
+        n_surveys >= resolved_min_surveys_absence &
+        n_surveys_detected >= 2 &
+        obs_detected_flag,
+
+      inconsistency_class = dplyr::case_when(
+        flag_high_pred_no_detection ~ "High predicted, not detected",
+        flag_pred_absent_detected   ~ "Predicted absent, detected",
+        TRUE                        ~ NA_character_
+      )
+    )
+
+  flag_sf <- hex_summary %>%
+    dplyr::filter(flag_high_pred_no_detection | flag_pred_absent_detected) %>%
+    dplyr::mutate(
+      flag_type = dplyr::case_when(
+        flag_high_pred_no_detection ~ "High predicted,\nnot detected",
+        flag_pred_absent_detected   ~ "Predicted absent,\ndetected",
+        TRUE                        ~ NA_character_
+      )
+    )
+
+  n_flag_high_pred_no_detection <- sum(
+    hex_summary$flag_high_pred_no_detection, na.rm = TRUE
+  )
+  n_flag_pred_absent_detected <- sum(
+    hex_summary$flag_pred_absent_detected, na.rm = TRUE
+  )
+
+  if (is.null(max_count_per_effort)) {
+    detected <- hex_summary$mean_count_per_effort[
+      !is.na(hex_summary$mean_count_per_effort) &
+        hex_summary$mean_count_per_effort > 0
+    ]
+    max_count_per_effort <- if (length(detected) == 0) 1 else
+      as.numeric(stats::quantile(detected, probs = 0.99, na.rm = TRUE))
+  }
+  if (!is.finite(max_count_per_effort) || max_count_per_effort <= 0) {
+    max_count_per_effort <- 1
+  }
+
+  # Use precomputed inner diameter when available
+  inner_diameter <- if ("hex_inner_diameter_m" %in% names(hex_summary)) {
+    hex_summary$hex_inner_diameter_m
+  } else {
+    hex_area <- as.numeric(sf::st_area(hex_summary))
+    2 * sqrt(hex_area / (2 * sqrt(3)))
+  }
+
+  circle_sf <- hex_summary %>%
+    dplyr::mutate(
+      mean_count_per_effort = dplyr::coalesce(mean_count_per_effort, 0),
+      n_surveys             = dplyr::coalesce(n_surveys, 0L),
+      count_scaled          = pmin(mean_count_per_effort,
+                                   max_count_per_effort) / max_count_per_effort,
+      circle_diameter = dplyr::if_else(
+        mean_count_per_effort > 0 & n_surveys > 0,
+        0.1 * inner_diameter +
+          sqrt(count_scaled) * (0.6 - 0.1) * inner_diameter,
+        0
+      ),
+      circle_radius = circle_diameter / 2
+    ) %>%
+    sf::st_point_on_surface()
+
+  xy        <- sf::st_coordinates(circle_sf)
+  circle_df <- circle_sf %>%
+    sf::st_drop_geometry() %>%
+    dplyr::mutate(x = xy[, 1], y = xy[, 2])
+
+  spearman_obs_pred_above_absence <- compute_filtered_spearman(
+    hex_summary       = hex_summary,
+    absence_threshold = abundance_thresholds$absence_threshold
+  )
+
+  corr_label <- paste0(
+    "Spearman rho = ",
+    ifelse(is.finite(spearman_obs_pred_above_absence),
+           round(spearman_obs_pred_above_absence, 2), "NA"),
+    "\nAbsence threshold <= ",
+    signif(abundance_thresholds$absence_threshold, 3),
+    "\nHigh threshold >= ",
+    signif(abundance_thresholds$high_pred_threshold, 3),
+    "\nHigh pred, no detection = ", n_flag_high_pred_no_detection,
+    "\nPred absent, detected = ",   n_flag_pred_absent_detected
+  )
+
+  bbox    <- sf::st_bbox(study_area)
+  corr_df <- data.frame(
+    x     = bbox["xmax"] - 0.0001 * (bbox["xmax"] - bbox["xmin"]),
+    y     = bbox["ymax"] - 0.0001 * (bbox["ymax"] - bbox["ymin"]),
+    label = corr_label
+  )
+
+  flag_fill_colours <- c(
+    "High predicted,\nnot detected" = flag_col_high_pred_no_detection,
+    "Predicted absent,\ndetected"   = flag_col_pred_absent_detected
+  )
+  
+  # Subset to only flag types present for this species — override.aes length
+  # must match the number of legend keys, which equals the number of active
+  # flag types when drop = FALSE is not in effect for the colour override.
+  active_flag_types   <- intersect(
+    names(flag_fill_colours),
+    unique(flag_sf$flag_type)
+  )
+  active_flag_colours <- unname(flag_fill_colours[active_flag_types])
+  
+
+  p <- ggplot2::ggplot() +
+    ggplot2::geom_sf(data = study_area, fill = "gray80", colour = NA) +
+    ggplot2::geom_raster(data = rast_zero,
+                         ggplot2::aes(x = x, y = y), fill = "white") +
+    ggplot2::geom_raster(data = rast_nonzero,
+                         ggplot2::aes(x = x, y = y, fill = value))
+
+  if (!is.null(water_to_plot)) {
+    p <- p + ggplot2::geom_sf(data = water_to_plot,
+                              fill = water_fill, colour = water_fill,
+                              linewidth = 0.1)
+  }
+
+  p <- p +
+    ggplot2::scale_fill_gradientn(
+      colours  = palette, limits = c(0, r_max),
+      oob      = scales::squish, na.value = "transparent",
+      trans    = transform, name = "Relative abundance",
+      guide    = ggplot2::guide_colourbar(order = 1)
+    ) +
+    ggnewscale::new_scale_fill() +
+
+    ggplot2::geom_sf(
+      data  = subset(hex_summary, n_surveys > 0),
+      fill  = NA, colour = "gray50", linewidth = 0.05, alpha = 0.1
+    ) +
+    ggplot2::geom_sf(
+      data  = flag_sf,
+      ggplot2::aes(fill = flag_type),
+      colour = NA, alpha = flag_fill_alpha
+    ) +
+    ggplot2::scale_fill_manual(
+      name   = "Diagnostic flags",
+      values = flag_fill_colours,
+      drop   = FALSE,
+      guide  = ggplot2::guide_legend(
+        order        = 2,
+        override.aes = list(
+          alpha     = flag_fill_alpha,
+          linewidth = flag_linewidth + 0.3,
+          colour    = active_flag_colours
+        )
+      )
+    ) +
+    ggplot2::geom_sf(
+      data  = flag_sf,
+      ggplot2::aes(colour = flag_type),
+      fill  = NA, linewidth = flag_linewidth, show.legend = FALSE
+    ) +
+    ggplot2::scale_colour_manual(
+      values = flag_fill_colours, drop = FALSE, guide = "none"
+    ) +
+    ggplot2::geom_sf(data = study_area, fill = NA, colour = "gray30", linewidth = 0.1) +
+    ggforce::geom_circle(
+      data = dplyr::filter(circle_df, circle_radius > 0),
+      ggplot2::aes(x0 = x, y0 = y, r = circle_radius),
+      alpha = 1, fill = circle_fill, colour = NA
+    ) +
+    ggspatial::annotation_scale(location = "br", width_hint = 0.25) +
+    ggplot2::geom_label(
+      data = corr_df,
+      ggplot2::aes(x = x, y = y, label = label),
+      hjust = 1, vjust = 1,
+      fill = "white", colour = "black",
+      label.size = 0, size = 6, family = "mono"
+    ) +
+    ggplot2::coord_sf() +
+    ggplot2::theme_void() +
+    ggplot2::theme(
+      legend.position      = c(0.03, 0.03),
+      legend.justification = c(0, 0),
+      legend.background    = ggplot2::element_rect(fill = "white", colour = NA),
+      legend.margin        = ggplot2::margin(4, 4, 4, 4),
+      legend.box.margin    = ggplot2::margin(6, 6, 6, 6),
+      plot.background      = ggplot2::element_rect(fill = "white",
+                                                   colour = "black",
+                                                   linewidth = 0.5),
+      panel.background     = ggplot2::element_rect(fill = "white", colour = NA),
+      plot.title    = ggplot2::element_text(size = 14, face = "bold", hjust = 0),
+      plot.subtitle = ggplot2::element_text(size = 12, hjust = 0,
+                                            margin = ggplot2::margin(b = 6))
+    ) +
+    ggplot2::labs(
+      title    = "Predicted vs observed",
+      subtitle = paste(
+        "Raster fill = model predicted relative abundance",
+        "Circle size = observed mean count in hexagon",
+        "Bold outlines + fills = diagnostic flags",
+        sep = "\n"
+      )
+    )
+
+  list(
+    plot        = p,
+    hex_summary = hex_summary,
+    spearman_obs_pred_above_absence = spearman_obs_pred_above_absence,
+    flag_counts = data.frame(
+      flag_high_pred_no_detection = n_flag_high_pred_no_detection,
+      flag_pred_absent_detected   = n_flag_pred_absent_detected
+    ),
+    flag_thresholds = c(
+      abundance_thresholds,
+      list(
+        high_pred_min_surveys     = resolved_min_surveys_high_pred,
+        high_pred_effort_quantile = flag_high_pred_effort_quantile,
+        absence_min_surveys       = resolved_min_surveys_absence,
+        absence_effort_quantile   = flag_absence_effort_quantile,
+        min_study_area_coverage   = min_study_area_coverage
+      )
+    )
+  )
+}
+
+
+# -- Panel C: honeycomb effort/detection map -----------------------------------
+
+#' @export
+plot_honeycomb <- function(hex_summary,
+                           study_area,
+                           water                = NULL,
+                           max_surveys          = NULL,
+                           max_count_per_effort = NULL,
+                           alpha_min            = 0.15,
+                           alpha_max            = 1,
+                           hex_fill             = "#B38F47",
+                           circle_fill          = "black",
+                           water_fill           = "#b8dceb") {
+
+  stopifnot(inherits(hex_summary, "sf"))
+  stopifnot(inherits(study_area,  "sf"))
+  stopifnot("n_surveys"             %in% names(hex_summary))
+  stopifnot("mean_count_per_effort" %in% names(hex_summary))
+
+  water_to_plot <- NULL
+  if (!is.null(water)) {
+    stopifnot(inherits(water, "processed_water"))
+    plot_crs    <- water$crs
+    study_area  <- sf::st_transform(study_area,  plot_crs)
+    hex_summary <- sf::st_transform(hex_summary, plot_crs)
+    water_to_plot <- resolve_water_layer(water, study_area)
+  } else {
+    plot_crs   <- sf::st_crs(hex_summary)
+    study_area <- sf::st_transform(study_area, plot_crs)
+  }
+
+  if (is.null(max_surveys)) {
+    surveyed    <- hex_summary$n_surveys[!is.na(hex_summary$n_surveys) &
+                                           hex_summary$n_surveys >= 1]
+    max_surveys <- if (length(surveyed) == 0) 1 else
+      as.numeric(stats::quantile(surveyed, probs = 0.8, na.rm = TRUE))
+  }
+  max_surveys <- ceiling(max_surveys)
+  if (!is.finite(max_surveys) || max_surveys < 1) max_surveys <- 1
+
+  if (is.null(max_count_per_effort)) {
+    detected <- hex_summary$mean_count_per_effort[
+      !is.na(hex_summary$mean_count_per_effort) &
+        hex_summary$mean_count_per_effort > 0
+    ]
+    max_count_per_effort <- if (length(detected) == 0) 1 else
+      as.numeric(stats::quantile(detected, probs = 0.99, na.rm = TRUE))
+  }
+  if (!is.finite(max_count_per_effort) || max_count_per_effort <= 0) {
+    max_count_per_effort <- 1
+  }
+
+  effort_info   <- make_effort_classes(max_surveys, alpha_min, alpha_max)
+  max_surveys   <- effort_info$max_surveys
+  effort_levels <- effort_info$effort_levels
+  alpha_values  <- effort_info$alpha_values
+
+  # Use precomputed inner diameter when available
+  inner_diameter <- if ("hex_inner_diameter_m" %in% names(hex_summary)) {
+    hex_summary$hex_inner_diameter_m
+  } else {
+    hex_area <- as.numeric(sf::st_area(hex_summary))
+    2 * sqrt(hex_area / (2 * sqrt(3)))
+  }
+
+  hex_summary_plot <- hex_summary %>%
+    dplyr::mutate(
+      n_surveys    = dplyr::coalesce(n_surveys, 0),
+      effort_class = dplyr::case_when(
+        n_surveys <= 0          ~ "0",
+        n_surveys > max_surveys ~ paste0(">", max_surveys),
+        TRUE ~ effort_info$positive_labels[
+          findInterval(n_surveys,
+                       vec              = c(0, effort_info$ends),
+                       rightmost.closed = TRUE)
+        ]
+      ),
+      effort_class = factor(effort_class, levels = effort_levels)
+    )
+
+  circle_sf <- hex_summary_plot %>%
+    dplyr::mutate(
+      mean_count_per_effort = dplyr::coalesce(mean_count_per_effort, 0),
+      count_scaled  = pmin(mean_count_per_effort, max_count_per_effort) /
+        max_count_per_effort,
+      circle_diameter = dplyr::if_else(
+        mean_count_per_effort > 0 & n_surveys > 0,
+        0.1 * inner_diameter +
+          sqrt(count_scaled) * (0.6 - 0.1) * inner_diameter,
+        0
+      ),
+      circle_radius = circle_diameter / 2
+    ) %>%
+    sf::st_point_on_surface()
+
+  xy        <- sf::st_coordinates(circle_sf)
+  circle_df <- circle_sf %>%
+    sf::st_drop_geometry() %>%
+    dplyr::mutate(x = xy[, 1], y = xy[, 2])
+
+  p <- ggplot2::ggplot() +
+    ggplot2::geom_sf(data = study_area, fill = NA, colour = "gray80", linewidth = 0.1)
+
+  if (!is.null(water_to_plot)) {
+    p <- p + ggplot2::geom_sf(data = water_to_plot,
+                              fill = water_fill, colour = water_fill,
+                              linewidth = 0.1)
+  }
+
+  p +
+    ggplot2::geom_sf(
+      data = hex_summary_plot,
+      ggplot2::aes(alpha = effort_class),
+      fill = hex_fill, colour = NA
+    ) +
+    ggforce::geom_circle(
+      data = dplyr::filter(circle_df, circle_radius > 0),
+      ggplot2::aes(x0 = x, y0 = y, r = circle_radius),
+      alpha = 1, fill = circle_fill, colour = NA
+    ) +
+    ggplot2::geom_point(
+      data = dplyr::filter(circle_df, circle_radius > 0),
+      ggplot2::aes(x = x, y = y, size = mean_count_per_effort),
+      shape = 21, fill = circle_fill, colour = NA, alpha = 0
+    ) +
+    ggspatial::annotation_scale(location = "br", width_hint = 0.25) +
+    ggplot2::scale_alpha_manual(
+      name   = "Survey effort",
+      values = alpha_values,
+      drop   = FALSE,
+      guide  = ggplot2::guide_legend(
+        override.aes = list(fill = hex_fill, colour = NA)
+      )
+    ) +
+    ggplot2::scale_size_continuous(
+      name  = "Mean count per effort",
+      guide = "none"
+    ) +
+    ggplot2::guides(
+      alpha = ggplot2::guide_legend(
+        order        = 1,
+        override.aes = list(fill = hex_fill, colour = NA)
+      )
+    ) +
+    ggplot2::coord_sf() +
+    ggplot2::theme_void() +
+    ggplot2::theme(
+      legend.position      = c(0.03, 0.03),
+      legend.justification = c(0, 0),
+      legend.background    = ggplot2::element_rect(fill = "white", colour = NA),
+      legend.margin        = ggplot2::margin(4, 4, 4, 4),
+      legend.box.margin    = ggplot2::margin(6, 6, 6, 6),
+      plot.background      = ggplot2::element_rect(fill = "white",
+                                                   colour = "black",
+                                                   linewidth = 0.5),
+      panel.background     = ggplot2::element_rect(fill = "white", colour = NA),
+      plot.title    = ggplot2::element_text(size = 14, face = "bold", hjust = 0),
+      plot.subtitle = ggplot2::element_text(size = 12, hjust = 0,
+                                            margin = ggplot2::margin(b = 6))
+    ) +
+    ggplot2::labs(
+      title    = "Relative survey effort",
+      subtitle = paste(
+        "Hex fill = Number of surveys in hexagon",
+        "Circle size = observed mean count in hexagon",
+        sep = "\n"
+      )
+    )
+}

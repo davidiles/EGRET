@@ -1,0 +1,103 @@
+library(sf)
+library(dplyr)
+library(ggplot2)
+library(ggspatial)
+library(patchwork)
+
+# Optional: simplify boundary only
+region_national_plot <- st_simplify(region_national, dTolerance = 1000)
+
+make_category_polygons <- function(x, category_col) {
+  x |>
+    select(category = {{ category_col }}, geometry) |>
+    group_by(category) |>
+    summarise(geometry = st_union(geometry), .groups = "drop")
+}
+
+for (species_name in species_list) {
+  
+  print(species_name)
+  
+  species_df <- hex_estimates %>%
+    filter(english_name == species_name)
+  
+  season_name <- species_df$season[1]
+  
+  out_file <- file.path(
+    out_path_figs,
+    paste0(
+      make.names(species_name),
+      "_",
+      season_name,
+      "_eBird_BAM.pdf"
+    )
+  )
+  
+  if (file.exists(out_file)) next
+  
+  species_sf <- hex_grid_national %>%
+    left_join(species_df, by = "hex_id") |>
+    mutate(
+      ebird_category = factor(
+        coalesce(ebird_category, "Not Modeled"),
+        levels = levels_order,
+        ordered = TRUE
+      ),
+      bam_category = factor(
+        coalesce(bam_category, "Not Modeled"),
+        levels = levels_order,
+        ordered = TRUE
+      )
+    ) %>%
+    dplyr::rename(geometry = geom)
+  
+  # Dissolve hexes by category before plotting
+  ebird_sf_plot <- make_category_polygons(species_sf, ebird_category)
+  bam_sf_plot   <- make_category_polygons(species_sf, bam_category)
+  
+  base_map_theme <- theme_bw() +
+    theme(
+      axis.title = element_blank(),
+      plot.title = element_text(hjust = 0.5),
+      legend.position = c(0.98, 0.98),
+      legend.justification = c(1, 1),
+      legend.background = element_rect(
+        fill = scales::alpha("white", 0.8),
+        colour = "grey50"
+      ),
+      legend.title = element_text(size = 9),
+      legend.text = element_text(size = 8)
+    )
+  
+  ebird_plot <- ggplot() +
+    geom_sf(data = ebird_sf_plot, aes(fill = category), col = NA) +
+    geom_sf(data = region_national_plot, col = "black", fill = NA, linewidth = 0.2) +
+    annotation_scale(location = "bl", width_hint = 0.25) +
+    scale_fill_manual(values = colpal, drop = FALSE, name = "Category") +
+    labs(title = "eBird") +
+    base_map_theme
+  
+  bam_plot <- ggplot() +
+    geom_sf(data = bam_sf_plot, aes(fill = category), col = NA) +
+    geom_sf(data = region_national_plot, col = "black", fill = NA, linewidth = 0.2) +
+    annotation_scale(location = "bl", width_hint = 0.25) +
+    scale_fill_manual(values = colpal, drop = FALSE, name = "Category") +
+    labs(title = "BAM") +
+    base_map_theme
+  
+  combined_plot <- ebird_plot + bam_plot +
+    plot_layout(nrow = 1) +
+    plot_annotation(
+      title = paste0(species_name, " - ", season_name)
+    )
+  
+  ggsave(
+    out_file,
+    combined_plot,
+    device = cairo_pdf,
+    width = 12,
+    height = 6,
+    units = "in",
+    bg = "white"
+  )
+}
