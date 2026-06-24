@@ -2,7 +2,7 @@
 
 ## Overview
 
-This repository produces national-scale bird relative abundance summaries for Canada using two independent data products:
+This repository produces national-scale bird relative abundance summaries for Canada using two national-scale data products:
 
 * eBird Status and Trends
 * Boreal Avian Modelling Project (BAM)
