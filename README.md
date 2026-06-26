@@ -188,6 +188,17 @@ Future releases may additionally calculate categories relative to:
 
 This would allow users to identify locations that are regionally important even when they contribute only a small proportion of the national population.
 
+### 4. Add columns for species classification
+
+Currently there is no indication of whether each species is a SAR or regional priority species
+
+This needs to be added
+
+### 5. Incorporate additional information to fill in range boundaries in areas that are not modeled
+
+This could involve additional range maps from other sources, and/or could be informed by
+raw data summaries.
+
 ---
 
 ## Intended Use
