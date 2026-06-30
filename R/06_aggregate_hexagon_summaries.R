@@ -1,5 +1,6 @@
 # ==============================================================================
-# Combine BAM and eBird hex-level abundance categories
+# Combine BAM and eBird hex-level abundance categories,
+# with raw data summaries and BirdLife range information
 # ==============================================================================
 
 library(tidyverse)
@@ -94,6 +95,29 @@ read_bam_hex_summary <- function(bam_species_code) {
     )
 }
 
+read_birdlife_hex_summary <- function(scientific_name) {
+  
+  path <- file.path(
+    OUT_HEX_SUMMARIES_BIRDLIFE,
+    paste0(make.names(scientific_name), "_BirdLife_hex_summary.rds")
+  )
+  
+  if (!file.exists(path)) return(NULL)
+  
+  x <- readRDS(path)
+  
+  # Only rows where the hexagon is inside the species' BirdLife range are
+  # kept; everything else resolves to NA after the join below, giving the
+  # "In range" / NA encoding requested.
+  x$hex_summary |>
+    sf::st_drop_geometry() |>
+    dplyr::filter(in_range_birdlife_any == 1L) |>
+    transmute(
+      hex_id,
+      range_BirdLife = "In range"
+    )
+}
+
 # ------------------------------------------------------------------------------
 # Combine species x hex summaries
 # ------------------------------------------------------------------------------
@@ -102,8 +126,9 @@ combined_hex_species <- purrr::map_dfr(seq_len(nrow(species_lookup)), function(i
   
   sp <- species_lookup[i, ]
   
-  ebird_dat <- read_ebird_hex_summary(sp$ebird_species_code)
-  bam_dat   <- read_bam_hex_summary(sp$bam_species_code)
+  ebird_dat    <- read_ebird_hex_summary(sp$ebird_species_code)
+  bam_dat      <- read_bam_hex_summary(sp$bam_species_code)
+  birdlife_dat <- read_birdlife_hex_summary(sp$scientific_name)
   
   if (is.null(ebird_dat)) {
     ebird_dat <- tibble(
@@ -124,7 +149,15 @@ combined_hex_species <- purrr::map_dfr(seq_len(nrow(species_lookup)), function(i
     )
   }
   
+  if (is.null(birdlife_dat)) {
+    birdlife_dat <- tibble(
+      hex_id = integer(),
+      range_BirdLife = character()
+    )
+  }
+  
   full_join(ebird_dat, bam_dat, by = "hex_id") |>
+    left_join(birdlife_dat, by = "hex_id") |>
     mutate(
       english_name = sp$english_name,
       scientific_name = sp$scientific_name,
@@ -150,6 +183,7 @@ combined_hex_species <- purrr::map_dfr(seq_len(nrow(species_lookup)), function(i
       ebird_predicted_abundance,
       ebird_category,
       ebird_coverage,
+      range_BirdLife,
       source_status
     )
 })
@@ -200,7 +234,7 @@ combined_hex_species <- combined_hex_species |>
 # ------------------------------------------------------------------------------
 
 dat_to_save <- combined_hex_species %>%
-  dplyr::select(hex_id,english_name,scientific_name,season,ebird_category,bam_category,date_label,n_surveys_bam_raw,n_surveys_detected_bam_raw) %>%
+  dplyr::select(hex_id,english_name,scientific_name,season,ebird_category,bam_category,range_BirdLife,date_label,n_surveys_bam_raw,n_surveys_detected_bam_raw) %>%
   dplyr::rename(date_range = date_label,
                 n_surveys = n_surveys_bam_raw,
                 n_detections = n_surveys_detected_bam_raw)
@@ -234,3 +268,6 @@ species_detected <- dat_to_save %>%
   subset(n_detections>0)
 length(unique(species_detected$english_name)) # 417 species detected at least once
 
+# BirdLife range coverage check
+table(dat_to_save$range_BirdLife, useNA = "always")
+mean(!is.na(dat_to_save$range_BirdLife)) # proportion of hex-species rows flagged "In range"

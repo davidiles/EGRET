@@ -97,6 +97,10 @@ hex_estimates <- read.csv(hex_estimates_path)
 
 colpal <- c("gray85", "white", "#FBF7E2", "#CEF2B0", "#18A065", "#006344")
 
+# CVD-safe binary palette for BirdLife in/out-of-range panel (deuteranomaly-safe:
+# grey vs. blue rather than red/green).
+colpal_birdlife <- c("Outside range" = "gray90", "In range" = "#0072B2")
+
 levels_order <- c(
   "Not Modeled",
   "Effectively Absent",
@@ -151,13 +155,18 @@ for (species_name in species_list) {
         coalesce(bam_category, "Not Modeled"),
         levels = levels_order,
         ordered = TRUE
+      ),
+      range_BirdLife = factor(
+        coalesce(range_BirdLife, "Outside range"),
+        levels = c("Outside range", "In range")
       )
     ) %>%
     dplyr::rename(geometry = geom)
   
   # Dissolve hexes by category before plotting
-  ebird_sf_plot <- make_category_polygons(species_sf, ebird_category)
-  bam_sf_plot   <- make_category_polygons(species_sf, bam_category)
+  ebird_sf_plot    <- make_category_polygons(species_sf, ebird_category)
+  bam_sf_plot      <- make_category_polygons(species_sf, bam_category)
+  birdlife_sf_plot <- make_category_polygons(species_sf, range_BirdLife)
   
   base_map_theme <- theme_bw() +
     theme(
@@ -199,7 +208,20 @@ for (species_name in species_list) {
     labs(title = "BAM") +
     base_map_theme
   
-  combined_plot <- ebird_plot + bam_plot +
+  birdlife_plot <- ggplot() +
+    geom_sf(data = birdlife_sf_plot, aes(fill = category), col = NA) +
+    geom_sf(
+      data = region_national,
+      colour = scales::alpha("black", 0.4),
+      fill = NA,
+      linewidth = 0.1
+    )+
+    annotation_scale(location = "bl", width_hint = 0.25) +
+    scale_fill_manual(values = colpal_birdlife, drop = FALSE, name = "BirdLife range") +
+    labs(title = "BirdLife") +
+    base_map_theme
+  
+  combined_plot <- ebird_plot + bam_plot + birdlife_plot +
     plot_layout(nrow = 1) +
     plot_annotation(
       title = paste0(species_name, " - ", season_name)
@@ -209,7 +231,7 @@ for (species_name in species_list) {
     out_file,
     combined_plot,
     device = cairo_pdf,
-    width = 20,
+    width = 28,
     height = 8,
     units = "in",
     bg = "white"
