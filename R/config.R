@@ -34,6 +34,8 @@ BCR_GPKG_PATH <- Sys.getenv(
 
 AVIAN_CORE_PATH <- "C:/Users/IlesD/OneDrive - EC-EC/Iles/Data/Avian_Core/Avian_Core_20251124.xlsx"
 AOS_PATH <- "C:/Users/IlesD/OneDrive - EC-EC/Iles/Data/AOS_BIRD_CODES/IBP-AOS-list25.csv"
+BIRDLIFE_RANGE_PATH <- "C:/Users/IlesD/OneDrive - EC-EC/Iles/Data/BirdLife_Range_Boundaries/BOTW_2025.gpkg"
+BIRDLIFE_SPECIES_PATH <- "C:/Users/IlesD/OneDrive - EC-EC/Iles/Data/BirdLife_Range_Boundaries/birdlife_species.xlsx"
 
 # ------------------------------------------------------------------------------
 # Output directories
@@ -53,6 +55,7 @@ OUT_NATIONAL_EBIRD_STATS   <- file.path(OUT_ROOT, "National", "eBird", "stats")
 #                  <OUT_HEX_SUMMARIES>/<spcd>_eBird_hex_summary.rds
 OUT_HEX_SUMMARIES_BAM <- file.path(OUT_ROOT, "hex_summaries/BAM")
 OUT_HEX_SUMMARIES_EBIRD <- file.path(OUT_ROOT, "hex_summaries/eBird")
+OUT_HEX_SUMMARIES_BIRDLIFE <- file.path(OUT_ROOT, "hex_summaries/BirdLife")
 
 # Shared spatial cache files (hex grid and precomputed metadata)
 OUT_CACHE <- file.path(OUT_ROOT, "cache")
@@ -113,18 +116,6 @@ RAST_MAX_Q <- 0.995
 # Variance-stabilising transformation applied to predicted values in plots.
 # Options: "identity", "sqrt", "log" (anything accepted by ggplot2 trans=).
 TRANSFORM <- "identity"
-
-
-# ------------------------------------------------------------------------------
-# BCR exclusions
-#
-# BCR labels to drop from the study area.  BCR 3 sub-units (3N, 3S, 3C) are
-# excluded because they fall largely outside the Canadian boreal/temperate
-# bird zone modelled by BAM.
-# ------------------------------------------------------------------------------
-
-BCR_EXCLUDE <- c("3N", "3S", "3C")
-
 
 # ------------------------------------------------------------------------------
 # Cumulative-population threshold parameters

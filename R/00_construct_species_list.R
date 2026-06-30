@@ -6,6 +6,7 @@ library(tidyverse)
 library(readxl)
 library(ebirdst)
 library(BAMexploreR)
+library(sf)
 
 rm(list = ls())
 

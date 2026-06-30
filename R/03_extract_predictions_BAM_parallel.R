@@ -284,7 +284,7 @@ future::plan(future::sequential)
 colpal <- c("white", "#FBF7E2", "#CEF2B0", "#18A065", "#006344")
 
 example_result <- readRDS(
-  file.path(OUT_HEX_SUMMARIES_BAM, "CANGOO_BAM_hex_summary.rds")
+  file.path(OUT_HEX_SUMMARIES_BAM, "AMPI_BAM_hex_summary.rds")
 )
 
 ggplot(example_result$hex_summary) +

@@ -49,8 +49,7 @@ study_area <- rnaturalearth::ne_states(country = "Canada") |>
 bcr <- sf::st_read(BCR_GPKG_PATH, quiet = TRUE) |>
   sf::st_transform(sf::st_crs(study_area)) |>
   sf::st_make_valid() |>
-  sf::st_intersection(study_area) |>
-  dplyr::filter(!(bcr_label %in% BCR_EXCLUDE))
+  sf::st_intersection(study_area)
 
 region_national <- sf::st_union(bcr) |>
   sf::st_as_sf() |>
