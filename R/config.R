@@ -140,7 +140,7 @@ TRANSFORM <- "identity"
 # ------------------------------------------------------------------------------
 
 CUMPOP_BREAKS <- list(
-  absent_upper = 0.001,   # hexagons summing to the lowest 0.1% of population
+  absent_upper = 0.01,   # hexagons summing to the lowest 0.1% of population
   low_upper    = 0.25,    # 0.1% – 25%  of cumulative population
   mod_upper    = 0.50,    # 25%  – 50%
   high_upper   = 0.75     # 50%  – 75%  (above = "Very High")
