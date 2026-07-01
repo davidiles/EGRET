@@ -237,20 +237,3 @@ for (species_name in species_list) {
     bg = "white"
   )
 }
-
-# ------------------------------------------------------------------------------
-# Examine a single hexagon
-# ------------------------------------------------------------------------------
-
-hex_focal = 25982
-
-dat = bam_sf %>%
-  filter(hex_id == hex_focal)
-
-
-
-ggplot()+
-  geom_sf(data = subset(hex_grid_national, hex_id == hex_focal), col = "blue", fill = "dodgerblue", linewidth = 1, alpha = 0.1)+
-  geom_sf(data = dat, col = "black")+
-  
-  theme_bw()
